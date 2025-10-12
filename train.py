@@ -154,7 +154,7 @@ def train(model_list, optimizer_list, train_loader, scheduler_list):
         print("model:{} best acc:{:.2f}".format(args.model_names[k], best_acc[k]))
 
 
-if __name__ == '_main_':
+if __name__ == '__main__':
     train_loader, val_loader = get_dataloader(args)
     model_list = []
     optimizer_list = []
