@@ -1,5 +1,6 @@
 import argparse
 import torch
+import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import MultiStepLR
 import torch.nn.functional as F
@@ -14,10 +15,84 @@ from tqdm import tqdm
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = True
 
+# ==========================================
+# DKD LOSS IMPLEMENTATION (Embedded)
+# ==========================================
+def dkd_loss(logits_student, logits_teacher, target, alpha, beta, temperature):
+    gt_mask = _get_gt_mask(logits_student, target)
+    other_mask = _get_other_mask(logits_student, target)
+    
+    pred_student = F.softmax(logits_student / temperature, dim=1)
+    pred_teacher = F.softmax(logits_teacher / temperature, dim=1)
+    
+    pred_student_cat = cat_mask(pred_student, gt_mask, other_mask)
+    pred_teacher_cat = cat_mask(pred_teacher, gt_mask, other_mask)
+    log_pred_student_cat = torch.log(pred_student_cat + 1e-8)
+    
+    tckd_loss = (
+        F.kl_div(log_pred_student_cat, pred_teacher_cat, reduction='batchmean')
+        * (temperature**2)
+    )
+    
+    pred_teacher_part2 = F.softmax(
+        logits_teacher / temperature - 1000.0 * gt_mask, dim=1
+    )
+    log_pred_student_part2 = F.log_softmax(
+        logits_student / temperature - 1000.0 * gt_mask, dim=1
+    )
+    
+    nckd_loss = (
+        F.kl_div(log_pred_student_part2, pred_teacher_part2, reduction='batchmean')
+        * (temperature**2)
+    )
+    
+    return alpha * tckd_loss + beta * nckd_loss
+
+def _get_gt_mask(logits, target):
+    target = target.reshape(-1)
+    mask = torch.zeros_like(logits).scatter_(1, target.unsqueeze(1), 1).bool()
+    return mask
+
+def _get_other_mask(logits, target):
+    target = target.reshape(-1)
+    mask = torch.ones_like(logits).scatter_(1, target.unsqueeze(1), 0).bool()
+    return mask
+
+def cat_mask(t, mask1, mask2):
+    t1 = (t * mask1).sum(dim=1, keepdims=True)
+    t2 = (t * mask2).sum(1, keepdims=True)
+    rt = torch.cat([t1, t2], dim=1)
+    return rt
+
+class DKDLoss(nn.Module):
+    def __init__(self, alpha, beta, temperature, warmup_epochs):
+        super(DKDLoss, self).__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.temperature = temperature
+        self.warmup_epochs = warmup_epochs
+
+    def forward(self, logits_student, logits_teacher, target, epoch):
+        # Warmup Strategy:
+        # If early epoch, return 0.0 loss (only learn from GT).
+        # Otherwise, the students will memorize the random noise of their peers.
+        if epoch < self.warmup_epochs:
+            return torch.tensor(0.0).to(logits_student.device)
+            
+        return dkd_loss(logits_student, logits_teacher, target, self.alpha, self.beta, self.temperature)
+
+# ==========================================
+# MAIN TRAINING SCRIPT
+# ==========================================
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--T', type=float, default=4.0)  # temperature
 parser.add_argument('--model_names', type=str, nargs='+', default=['resnet20', 'resnet20'])
-parser.add_argument('--alpha', type=float, default=0.5)  # weight for ce and kl
+
+# Replaced original alpha with DKD specific params
+parser.add_argument('--dkd_alpha', type=float, default=1.0, help='Weight for TCKD (Target Class)')
+parser.add_argument('--dkd_beta', type=float, default=8.0, help='Weight for NCKD (Non-Target Class)')
+parser.add_argument('--warmup', type=int, default=20, help='Epochs to wait before enabling DKD')
 
 parser.add_argument('--root', type=str, default='dataset')
 parser.add_argument('--batch_size', type=int, default=64)
@@ -42,27 +117,28 @@ np.random.seed(args.seed)
 torch.cuda.manual_seed(args.seed)
 os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_id)
 
-exp_name = '_'.join(args.model_names)
+exp_name = '_'.join(args.model_names) + '_DKD'
 exp_path = './experiments/{}/{}'.format(exp_name, datetime.now().strftime('%Y-%m-%d-%H-%M'))
 os.makedirs(exp_path, exist_ok=True)
-print(exp_path)
+print(f"Experiment Path: {exp_path}")
 
+# Initialize DKD Loss Criterion
+criterion_dkd = DKDLoss(alpha=args.dkd_alpha, beta=args.dkd_beta, temperature=args.T, warmup_epochs=args.warmup)
 
-def train_one_epoch(models, optimizers, train_loader,epoch):
+def train_one_epoch(models, optimizers, train_loader, epoch):
     acc_recorder_list = []
     loss_recorder_list = []
     for model in models:
         model.train()
         acc_recorder_list.append(AverageMeter())
         loss_recorder_list.append(AverageMeter())
-# After
+
     for i, (imgs, label) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epoch}")):
-        # torch.Size([batch, num_model, 3, 32, 32]) torch.Size([batch])
         outputs = torch.zeros(size=(len(models), imgs.size(0), 100), dtype=torch.float).cuda()
         out_list = []
-        # forward
+        
+        # Forward pass for all models
         for model_idx, model in enumerate(models):
-
             if torch.cuda.is_available():
                 imgs = imgs.cuda()
                 label = label.cuda()
@@ -71,21 +147,25 @@ def train_one_epoch(models, optimizers, train_loader,epoch):
             outputs[model_idx, ...] = out
             out_list.append(out)
 
-        # backward
+        # Generate Ensemble "Teacher" (Average of Logits)
         stable_out = outputs.mean(dim=0)
-        stable_out = stable_out.detach()
+        stable_out = stable_out.detach() # Teacher targets must not have gradients
 
+        # Calculate Loss and Backward
         for model_idx, model in enumerate(models):
+            # 1. Standard Cross Entropy Loss (Ground Truth)
             ce_loss = F.cross_entropy(out_list[model_idx], label)
-            div_loss = F.kl_div(
-                F.log_softmax(out_list[model_idx] / args.T, dim=1),
-                F.softmax(stable_out / args.T, dim=1),
-                reduction='batchmean'
-            ) * args.T * args.T
+            
+            # 2. Decoupled Knowledge Distillation Loss (Peer Ensemble)
+            # We pass the current 'epoch' so it knows if it should be in warmup mode
+            dkd_loss_val = criterion_dkd(out_list[model_idx], stable_out, label, epoch)
 
-            loss = (1 - args.alpha) * ce_loss + (args.alpha) * div_loss
+            # Total Loss
+            loss = ce_loss + dkd_loss_val
 
             optimizers[model_idx].zero_grad()
+            
+            # Handle computation graph retention if sharing graphs (usually fine to just backward)
             if model_idx < len(models) - 1:
                 loss.backward(retain_graph=True)
             else:
@@ -130,7 +210,7 @@ def evaluation(models, val_loader):
 def train(model_list, optimizer_list, train_loader, scheduler_list):
     best_acc = [-1 for _ in range(args.num_branch)]
     for epoch in range(args.epoch):
-        train_losses, train_acces = train_one_epoch(model_list, optimizer_list, train_loader,epoch)
+        train_losses, train_acces = train_one_epoch(model_list, optimizer_list, train_loader, epoch)
         val_losses, val_acces = evaluation(model_list, val_loader)
 
         for i in range(len(best_acc)):
@@ -144,10 +224,10 @@ def train(model_list, optimizer_list, train_loader, scheduler_list):
 
             scheduler_list[i].step()
 
-        if (epoch + 1) % args.print_freq == 0:
+        if (epoch + 1) % args.print_freq == 0 or epoch < 5: # Print early epochs too
             for j in range(len(best_acc)):
-                print("model:{} train loss:{:.2f} acc:{:.2f}  val loss{:.2f} acc:{:.2f}".format(
-                    args.model_names[j], train_losses[j], train_acces[j], val_losses[j],
+                print("Epoch [{}] model:{} train loss:{:.2f} acc:{:.2f}  val loss{:.2f} acc:{:.2f}".format(
+                    epoch+1, args.model_names[j], train_losses[j], train_acces[j], val_losses[j],
                     val_acces[j]))
 
     for k in range(len(best_acc)):
