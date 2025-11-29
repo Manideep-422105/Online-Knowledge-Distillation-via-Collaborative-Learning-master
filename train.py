@@ -134,54 +134,52 @@ def train_one_epoch(models, optimizers, train_loader, epoch):
         loss_recorder_list.append(AverageMeter())
 
     for i, (imgs, label) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epoch}")):
-        outputs = torch.zeros(size=(len(models), imgs.size(0), 100), dtype=torch.float).cuda()
         out_list = []
         
-        # Forward pass for all models
-        for model_idx, model in enumerate(models):
-            if torch.cuda.is_available():
-                imgs = imgs.cuda()
-                label = label.cuda()
+        # 1. Forward pass for all models
+        if torch.cuda.is_available():
+            imgs = imgs.cuda()
+            label = label.cuda()
 
+        for model_idx, model in enumerate(models):
             out = model.forward(imgs[:, model_idx, ...])
-            outputs[model_idx, ...] = out
             out_list.append(out)
 
-        # Generate Ensemble "Teacher" (Average of Logits)
-        stable_out = outputs.mean(dim=0)
-        stable_out = stable_out.detach() # Teacher targets must not have gradients
-
-        # Calculate Loss and Backward
-        for model_idx, model in enumerate(models):
-            # 1. Standard Cross Entropy Loss (Ground Truth)
-            ce_loss = F.cross_entropy(out_list[model_idx], label)
+        # 2. Calculate Loss (Peer-to-Peer)
+        for student_idx, student_model in enumerate(models):
             
-            # 2. Decoupled Knowledge Distillation Loss (Peer Ensemble)
-            # We pass the current 'epoch' so it knows if it should be in warmup mode
-            dkd_loss_val = criterion_dkd(out_list[model_idx], stable_out, label, epoch)
+            # Identify the Teacher (The peer)
+            # If 2 models: 0 learns from 1, 1 learns from 0
+            teacher_idx = (student_idx + 1) % len(models)
+            
+            logits_student = out_list[student_idx]
+            logits_teacher = out_list[teacher_idx].detach() # Detach teacher!
 
-            # Total Loss
+            # 1. CE Loss
+            ce_loss = F.cross_entropy(logits_student, label)
+            
+            # 2. DKD Loss (One-on-One)
+            dkd_loss_val = criterion_dkd(logits_student, logits_teacher, label, epoch)
+
             loss = ce_loss + dkd_loss_val
 
-            optimizers[model_idx].zero_grad()
+            optimizers[student_idx].zero_grad()
             
-            # Handle computation graph retention if sharing graphs (usually fine to just backward)
-            if model_idx < len(models) - 1:
+            if student_idx < len(models) - 1:
                 loss.backward(retain_graph=True)
             else:
                 loss.backward()
 
-            optimizers[model_idx].step()
+            optimizers[student_idx].step()
 
-            loss_recorder_list[model_idx].update(loss.item(), n=imgs.size(0))
-            acc = accuracy(out_list[model_idx], label)[0]
-            acc_recorder_list[model_idx].update(acc.item(), n=imgs.size(0))
+            loss_recorder_list[student_idx].update(loss.item(), n=imgs.size(0))
+            acc = accuracy(logits_student, label)[0]
+            acc_recorder_list[student_idx].update(acc.item(), n=imgs.size(0))
 
     losses = [recorder.avg for recorder in loss_recorder_list]
     acces = [recorder.avg for recorder in acc_recorder_list]
     return losses, acces
-
-
+    
 def evaluation(models, val_loader):
     acc_recorder_list = []
     loss_recorder_list = []
