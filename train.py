@@ -4,7 +4,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import MultiStepLR
 import torch.nn.functional as F
-from data import get_dataloader
 from models import model_dict
 import os
 from utils import AverageMeter, accuracy
@@ -74,19 +73,49 @@ class DKDLoss(nn.Module):
         return dkd_loss(logits_student, logits_teacher, target, self.alpha, self.beta, self.temperature)
 
 # ==========================================
-# 2. ARGUMENTS
+# 2. DATA LOADER (Embedded to fix Download Error)
+# ==========================================
+def get_dataloader(args):
+    print(f"==> Preparing Data: {args.dataset}")
+    transform_train = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+    ])
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+    ])
+
+    if args.dataset == 'cifar100':
+        # download=True fixes the FileNotFoundError
+        train_set = datasets.CIFAR100(root=args.root, train=True, download=True, transform=transform_train)
+        test_set = datasets.CIFAR100(root=args.root, train=False, download=True, transform=transform_test)
+        num_classes = 100
+    else:
+        # Fallback to CIFAR10
+        train_set = datasets.CIFAR10(root=args.root, train=True, download=True, transform=transform_train)
+        test_set = datasets.CIFAR10(root=args.root, train=False, download=True, transform=transform_test)
+        num_classes = 10
+    
+    train_loader = torch.utils.data.DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+    test_loader = torch.utils.data.DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    
+    return train_loader, test_loader, num_classes
+
+# ==========================================
+# 3. ARGUMENTS
 # ==========================================
 parser = argparse.ArgumentParser()
-# Benchmark Arguments
 parser.add_argument('--dataset', type=str, default='cifar100', choices=['cifar10', 'cifar100'])
 parser.add_argument('--mode', type=str, default='dkd', choices=['kdcl', 'dkd'], help='Run standard KDCL or DKD')
 
-# Standard Arguments
 parser.add_argument('--T', type=float, default=4.0)
 parser.add_argument('--model_names', type=str, nargs='+', default=['resnet32', 'ShuffleV1'])
-parser.add_argument('--root', type=str, default='dataset')
+parser.add_argument('--root', type=str, default='./dataset')
 parser.add_argument('--batch_size', type=int, default=64)
-parser.add_argument('--num_workers', type=int, default=1)
+parser.add_argument('--num_workers', type=int, default=2)
 parser.add_argument('--epoch', type=int, default=240)
 parser.add_argument('--lr', type=float, default=0.05)
 parser.add_argument('--momentum', type=float, default=0.9)
@@ -97,18 +126,14 @@ parser.add_argument('--seed', type=int, default=1)
 parser.add_argument('--gpu-id', type=int, default=0)
 parser.add_argument('--print_freq', type=int, default=100)
 
-# Method Specific Params
 parser.add_argument('--dkd_alpha', type=float, default=1.0)
 parser.add_argument('--dkd_beta', type=float, default=2.0)
 parser.add_argument('--warmup', type=int, default=20)
-parser.add_argument('--kdcl_alpha', type=float, default=0.5, help='Weight for KDCL standard loss')
+parser.add_argument('--kdcl_alpha', type=float, default=0.5)
 
 args = parser.parse_args()
 args.num_branch = len(args.model_names)
 
-# ==========================================
-# 3. SETUP
-# ==========================================
 torch.manual_seed(args.seed)
 np.random.seed(args.seed)
 torch.cuda.manual_seed(args.seed)
@@ -141,25 +166,20 @@ def train_one_epoch(models, optimizers, train_loader, epoch):
         outputs = torch.zeros(size=(len(models), imgs.size(0), 100), dtype=torch.float).cuda()
         out_list = []
         
-        # Forward
         for model_idx, model in enumerate(models):
             out = model.forward(imgs[:, model_idx, ...])
             outputs[model_idx, ...] = out
             out_list.append(out)
 
-        # Ensemble Teacher (Average)
         stable_out = outputs.mean(dim=0).detach()
 
-        # Loss Calculation
         for model_idx, model in enumerate(models):
             ce_loss = F.cross_entropy(out_list[model_idx], label)
             
             if args.mode == 'dkd':
-                # --- NEW METHOD: DKD ---
                 dist_loss = criterion_dkd(out_list[model_idx], stable_out, label, epoch)
                 loss = ce_loss + dist_loss
             else:
-                # --- OLD METHOD: Standard KDCL ---
                 kl_loss = F.kl_div(
                     F.log_softmax(out_list[model_idx] / args.T, dim=1),
                     F.softmax(stable_out / args.T, dim=1),
@@ -178,9 +198,7 @@ def train_one_epoch(models, optimizers, train_loader, epoch):
             acc = accuracy(out_list[model_idx], label)[0]
             acc_recorder_list[model_idx].update(acc.item(), n=imgs.size(0))
 
-    losses = [recorder.avg for recorder in loss_recorder_list]
-    acces = [recorder.avg for recorder in acc_recorder_list]
-    return losses, acces
+    return [r.avg for r in loss_recorder_list], [r.avg for r in acc_recorder_list]
 
 
 def evaluation(models, val_loader):
@@ -203,9 +221,7 @@ def evaluation(models, val_loader):
                 loss = F.cross_entropy(out, label)
                 acc_recorder_list[model_idx].update(acc.item(), img.size(0))
                 loss_recorder_list[model_idx].update(loss.item(), img.size(0))
-    losses = [recorder.avg for recorder in loss_recorder_list]
-    acces = [recorder.avg for recorder in acc_recorder_list]
-    return losses, acces
+    return [r.avg for r in loss_recorder_list], [r.avg for r in acc_recorder_list]
 
 
 def train(model_list, optimizer_list, train_loader, scheduler_list):
@@ -217,8 +233,7 @@ def train(model_list, optimizer_list, train_loader, scheduler_list):
         for i in range(len(best_acc)):
             if val_acces[i] > best_acc[i]:
                 best_acc[i] = val_acces[i]
-                state_dict = dict(epoch=epoch + 1, model=model_list[i].state_dict(),
-                                  acc=val_acces[i])
+                state_dict = dict(epoch=epoch + 1, model=model_list[i].state_dict(), acc=val_acces[i])
                 name = os.path.join(exp_path, args.model_names[i], 'ckpt', 'best.pth')
                 os.makedirs(os.path.dirname(name), exist_ok=True)
                 torch.save(state_dict, name)
@@ -237,17 +252,20 @@ def train(model_list, optimizer_list, train_loader, scheduler_list):
 
 
 if __name__ == '__main__':
-    train_loader, val_loader = get_dataloader(args)
+    # Use internal get_dataloader instead of importing from data.py
+    train_loader, val_loader, num_classes = get_dataloader(args)
+    
     model_list = []
     optimizer_list = []
     scheduler_list = []
+    
     for name in args.model_names:
         lr = 0.01 if name in ['MobileNetV2', 'ShuffleV1', 'ShuffleV2'] else args.lr
-        model = model_dict[name](num_classes=100)
+        # Pass num_classes dynamically
+        model = model_dict[name](num_classes=num_classes)
         if torch.cuda.is_available(): model = model.cuda()
 
-        optimizer = optim.SGD(model.parameters(), lr=lr, momentum=args.momentum,
-                              weight_decay=args.weight_decay)
+        optimizer = optim.SGD(model.parameters(), lr=lr, momentum=args.momentum, weight_decay=args.weight_decay)
         scheduler = MultiStepLR(optimizer, args.milestones, args.gamma)
         model_list.append(model)
         optimizer_list.append(optimizer)
