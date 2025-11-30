@@ -166,20 +166,29 @@ def train_one_epoch(models, optimizers, train_loader, epoch):
         outputs = torch.zeros(size=(len(models), imgs.size(0), 100), dtype=torch.float).cuda()
         out_list = []
         
+        # Forward
         for model_idx, model in enumerate(models):
-            out = model.forward(imgs[:, model_idx, ...])
+            # === FIX IS HERE ===
+            # Old Code: out = model.forward(imgs[:, model_idx, ...]) 
+            # New Code: We pass the whole image batch directly
+            out = model.forward(imgs) 
+            # ===================
             outputs[model_idx, ...] = out
             out_list.append(out)
 
+        # Ensemble Teacher (Average)
         stable_out = outputs.mean(dim=0).detach()
 
+        # Loss Calculation
         for model_idx, model in enumerate(models):
             ce_loss = F.cross_entropy(out_list[model_idx], label)
             
             if args.mode == 'dkd':
+                # --- NEW METHOD: DKD ---
                 dist_loss = criterion_dkd(out_list[model_idx], stable_out, label, epoch)
                 loss = ce_loss + dist_loss
             else:
+                # --- OLD METHOD: Standard KDCL ---
                 kl_loss = F.kl_div(
                     F.log_softmax(out_list[model_idx] / args.T, dim=1),
                     F.softmax(stable_out / args.T, dim=1),
@@ -199,7 +208,6 @@ def train_one_epoch(models, optimizers, train_loader, epoch):
             acc_recorder_list[model_idx].update(acc.item(), n=imgs.size(0))
 
     return [r.avg for r in loss_recorder_list], [r.avg for r in acc_recorder_list]
-
 
 def evaluation(models, val_loader):
     acc_recorder_list = []
